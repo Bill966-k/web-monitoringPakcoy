@@ -73,12 +73,51 @@ def theme(ch, h=240, title=''):
                               domainColor=GRID, tickColor=GRID)
               .configure_legend(labelColor='#E6F0E9', titleColor=MUTED, orient='bottom'))
 
-def live_chart(df, col, color, title, dom):
-    ch = alt.Chart(df).mark_area(line={'color': color, 'strokeWidth': 2.5},
-                                 color=color, opacity=.18, interpolate='monotone').encode(
-        x=alt.X('t:Q', axis=alt.Axis(labels=False, ticks=False, title=None)),
+def rgba(hexc, a):
+    h = hexc.lstrip('#')
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return f'rgba({r},{g},{b},{a})'
+
+def wave(i, k):
+    return 0.55 * np.sin(i * 0.9 + k) + 0.35 * np.sin(i * 2.1 + 2 * k) + 0.10 * np.sin(i * 5.3 + k)
+
+@st.cache_data
+def make_sim(df, amp):
+    s = df.copy()
+    idx = np.arange(len(s))
+    s['moisture'] = (s['moisture'] + amp * 1.8 * wave(idx, 0.0)).round(1)
+    s['temp'] = (s['temp'] + amp * 0.5 * wave(idx, 1.7)).round(2)
+    return s
+
+def delta_html(a, b, unit, dec=1):
+    d = a - b
+    if d > 0.05: arrow, col = '▲', LIME
+    elif d < -0.05: arrow, col = '▼', AMBER
+    else: arrow, col = '■', MUTED
+    return f'<span style="color:{col}">{arrow} {abs(d):.{dec}f}{unit}</span> dari sebelumnya'
+
+def live_chart(df, col, color, title, minhalf):
+    lo, hi = df[col].min(), df[col].max()
+    mid = (lo + hi) / 2
+    half = max((hi - lo) / 2 + minhalf * 0.25, minhalf)
+    dom = [mid - half, mid + half]
+    grad = alt.Gradient(gradient='linear', x1=1, x2=1, y1=1, y2=0, stops=[
+        alt.GradientStop(color=rgba(color, 0.0), offset=0),
+        alt.GradientStop(color=rgba(color, 0.35), offset=1)])
+    enc = dict(
+        x=alt.X('t:Q', scale=alt.Scale(nice=False),
+                axis=alt.Axis(labels=False, ticks=False, title=None, grid=False)),
         y=alt.Y(f'{col}:Q', scale=alt.Scale(domain=dom), title=None))
-    return theme(ch, 230, title)
+    area = alt.Chart(df).mark_area(interpolate='monotone', clip=True,
+                                   line={'color': color, 'strokeWidth': 2.5},
+                                   color=grad).encode(**enc)
+    now = df.tail(1)
+    ring = alt.Chart(now).mark_circle(size=380, color=color, opacity=0.22).encode(**enc)
+    dot = alt.Chart(now).mark_circle(size=90, color=color, opacity=1).encode(**enc)
+    txt = alt.Chart(now).mark_text(dx=-14, dy=-14, align='right', fontWeight='bold',
+                                   color='#E6F0E9').encode(
+        text=alt.Text(f'{col}:Q', format='.1f'), **enc)
+    return theme(alt.layer(area, ring, dot, txt), 240, title)
 
 def get_phase(m, thr):
     if m >= thr['Siap Panen']: return 'Siap Panen'
@@ -147,27 +186,31 @@ if page == 'Beranda':
 # ================= SENSOR LIVE =================
 elif page == 'Sensor Live':
     st.markdown('### Sensor Live')
-    st.caption('Simulasi pembacaan sensor dari dataset, diputar ulang otomatis.')
-    st.toggle('Putar otomatis', value=True, key='play')
+    st.caption('Simulasi sensor: nilai dataset + variasi kecil supaya grafik bergerak naik-turun.')
+    a0, b0 = st.columns([1, 2])
+    a0.toggle('Putar otomatis', value=True, key='play')
+    b0.slider('Variasi simulasi (0 = nilai dataset apa adanya)', 0.0, 2.0, 1.0, 0.1, key='noise')
+    sim = make_sim(raw, float(st.session_state['noise']))
 
     def live_body():
-        if 'idx' not in st.session_state: st.session_state.idx = 30
+        if 'idx' not in st.session_state: st.session_state.idx = 40
         if st.session_state.get('play', True):
-            st.session_state.idx = (st.session_state.idx + 1) % len(raw)
+            st.session_state.idx = (st.session_state.idx + 1) % len(sim)
         i = st.session_state.idx
-        cur = raw.iloc[i]
+        cur, prev = sim.iloc[i], sim.iloc[i - 1]
         cond = str(cur['soil_cond'])
         ccol = {'Wet': MINT, 'Optimal': LIME, 'Dry': AMBER}.get(cond, MUTED)
+        st.caption(f"Pembacaan: DAP {int(cur['dap'])} · jam {str(cur['time'])[:5]}")
         a, b, c, d = st.columns(4)
-        with a: card('Kelembaban tanah', f"{cur['moisture']:.0f}%", f"DAP {int(cur['dap'])} · {str(cur['time'])[:5]}")
-        with b: card('Suhu', f"{cur['temp']:.1f}°C", 'sensor lingkungan')
+        with a: card('Kelembaban tanah', f"{cur['moisture']:.1f}%", delta_html(cur['moisture'], prev['moisture'], '%'))
+        with b: card('Suhu', f"{cur['temp']:.1f}°C", delta_html(cur['temp'], prev['temp'], '°C', 2))
         with c: card('Kondisi tanah', cond, f'<span style="color:{ccol}">● status</span>')
         with d: card('Kematangan', f"{cur['maturity']:.0f}%", str(cur['phase']))
-        win = raw.iloc[max(0, i - 35):i + 1].copy()
+        win = sim.iloc[max(0, i - 39):i + 1].copy()
         win['t'] = range(len(win))
         g1, g2 = st.columns(2)
-        g1.altair_chart(live_chart(win, 'moisture', MINT, 'Kelembaban tanah (%)', [40, 85]), theme=None, width='stretch')
-        g2.altair_chart(live_chart(win, 'temp', AMBER, 'Suhu (°C)', [22, 33]), theme=None, width='stretch')
+        g1.altair_chart(live_chart(win, 'moisture', MINT, 'Kelembaban tanah (%)', 3.0), theme=None, width='stretch')
+        g2.altair_chart(live_chart(win, 'temp', AMBER, 'Suhu (°C)', 0.8), theme=None, width='stretch')
 
     st.fragment(run_every=float(st.session_state['speed']))(live_body)()
 
